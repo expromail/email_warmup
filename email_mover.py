@@ -1,5 +1,6 @@
 import functools
 import json
+import os
 import random
 import re
 import sys
@@ -14,16 +15,48 @@ from clickhouse_driver import Client
 from requests.exceptions import RequestException
 from tqdm.notebook import tqdm
 
-api_key = 'xxxxxx'
-service_url = 'https://maileng.maildoso.co'
-parallel_processes = 3
+
+def load_env(path: str = ".env"):
+    env_vars = {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as env_file:
+            for line in env_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+
+                if "=" not in stripped:
+                    continue
+
+                key, value = stripped.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if (value.startswith("\"") and value.endswith("\"")) or (
+                    value.startswith("'") and value.endswith("'")
+                ):
+                    value = value[1:-1]
+
+                env_vars[key] = value
+    except FileNotFoundError:
+        pass
+
+    return env_vars
+
+
+env = {**load_env(), **os.environ}
+
+api_key = env.get("EE_API", "xxxxxx")
+service_url = env.get("EE_URL", "https://maileng.maildoso.co")
+parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
 logs_file = "logs.txt"
 clickhouse_config = {
-    "host": "localhost",
-    "port": 9000,
-    "user": "default",
-    "password": "",
-    "database": "default",
+    "host": env.get("CH_HOST", "localhost"),
+    "port": int(env.get("CH_PORT", 9000)),
+    "user": env.get("CH_USER", "default"),
+    "password": env.get("CH_PASSWORD", ""),
+    "database": env.get("CH_DATABASE", "default"),
 }
 
 sql_query = """

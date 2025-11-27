@@ -58,13 +58,18 @@ api_key = env.get("EE_API", "xxxxxx")
 service_url = env.get("EE_URL", "https://maileng.maildoso.co")
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
 logs_file = "logs.txt"
+
+port_value = env.get("CH_PORT", "9000")
+ch_port = int(port_value)
+secure_default = ch_port in {443, 8443, 9440}
+
 clickhouse_config = {
     "host": env.get("CH_HOST", "localhost"),
-    "port": int(env.get("CH_PORT", 9000)),
+    "port": ch_port,
     "user": env.get("CH_USER", "default"),
     "password": env.get("CH_PASSWORD", ""),
     "database": env.get("CH_DATABASE", "default"),
-    "secure": str_to_bool(env.get("CH_SECURE"), False),
+    "secure": str_to_bool(env.get("CH_SECURE"), secure_default),
     "verify": str_to_bool(env.get("CH_VERIFY"), True),
 }
 

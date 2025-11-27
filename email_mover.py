@@ -47,6 +47,13 @@ def load_env(path: str = ".env"):
 
 env = {**load_env(), **os.environ}
 
+
+def str_to_bool(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 api_key = env.get("EE_API", "xxxxxx")
 service_url = env.get("EE_URL", "https://maileng.maildoso.co")
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
@@ -57,6 +64,8 @@ clickhouse_config = {
     "user": env.get("CH_USER", "default"),
     "password": env.get("CH_PASSWORD", ""),
     "database": env.get("CH_DATABASE", "default"),
+    "secure": str_to_bool(env.get("CH_SECURE"), False),
+    "verify": str_to_bool(env.get("CH_VERIFY"), True),
 }
 
 sql_query = """
@@ -64,7 +73,7 @@ SELECT ee_id, ee_account_id
 FROM email_letters
 WHERE 1=1
     AND date(created_at) >= today() - INTERVAL '1 day'
-    AND path = '\Junk'
+    AND path = '\\Junk'
     AND ee_account_id IN ( '00qky1lezp40912i',
 '098yk4r2jkfs0hhn',
 '0cz5e4agx45gbdy4',

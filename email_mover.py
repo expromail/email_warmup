@@ -77,7 +77,7 @@ sql_query = """
 SELECT ee_id, ee_account_id
 FROM email_letters
 WHERE 1=1
-    AND date(created_at) >= today() - INTERVAL '1 day'
+    AND date(created_at) >= today() - INTERVAL '2 day'
     AND path = '\\Junk'
     AND status = 'received'
     AND ee_account_id IN ( '00qky1lezp40912i',

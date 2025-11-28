@@ -104,6 +104,8 @@ def retry_on_status_code(retries=3, delay=2):
                 status_code = response.get("statusCode")
                 if status_code == 200:
                     return response
+                if status_code == 404:
+                    return response
 
                 attempt += 1
                 print(f"Retry {attempt}/{retries} for {func.__name__} - Status: {status_code}")

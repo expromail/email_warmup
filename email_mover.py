@@ -192,6 +192,10 @@ def process_move(record):
         log_successful_id(ee_id)
         print(f"Moved message to INBOX: {ee_id}")
         return ee_id
+    if status_code == 404:
+        log_successful_id(ee_id)
+        print(f"Message not found (404), recorded id to skip: {ee_id}")
+        return None
     print(f"Failed to move message {ee_id}: status {status_code}")
     return None
 

@@ -300,6 +300,8 @@ def main():
     processed_ids = read_logged_ids(logs_file)
     pending_records = [record for record in records if record[0] not in processed_ids]
 
+    print(f"Fetched {len(pending_records)} messages from the database to move.")
+
     if not pending_records:
         print("No new messages to move.")
         return

@@ -7,7 +7,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from multiprocessing import Pool
+from multiprocessing import Manager, Pool
 
 import pandas as pd
 import requests
@@ -64,8 +64,8 @@ clickhouse_config = {
     "user": env.get("CH_USER", "default"),
     "password": env.get("CH_PASSWORD", ""),
     "database": env.get("CH_DATABASE", "default"),
-    "secure": str_to_bool(env.get("CH_SECURE"), False),
-    "verify": str_to_bool(env.get("CH_VERIFY"), True),
+    "secure": str_to_bool(env.get("CH_SECURE"), True),
+    "verify": str_to_bool(env.get("CH_VERIFY"), False),
 }
 
 sql_query = """
@@ -174,7 +174,6 @@ WHERE 1=1
 'z7r4by56vytsbn25',
 'zetg53ny0tiep7ir',
 'zumiz35fgqs6wads' )
-LIMIT 100
 """
 
 
@@ -260,11 +259,33 @@ def fetch_messages(client):
     return client.execute(sql_query)
 
 
+log_lock = None
+
+
+def init_pool(lock):
+    global log_lock
+    log_lock = lock
+
+
+def log_successful_id(message_id):
+    # persist immediately to survive interruptions
+    if log_lock:
+        with log_lock:
+            append_logged_ids(logs_file, [message_id])
+    else:
+        append_logged_ids(logs_file, [message_id])
+
+
 def process_move(record):
     ee_id, ee_account_id = record
     response = move_message_to_folder(ee_account_id, ee_id, "INBOX")
     status_code = response.get("statusCode") if isinstance(response, dict) else None
-    return ee_id if status_code == 200 else None
+    if status_code == 200:
+        log_successful_id(ee_id)
+        print(f"Moved message to INBOX: {ee_id}")
+        return ee_id
+    print(f"Failed to move message {ee_id}: status {status_code}")
+    return None
 
 
 def main():
@@ -278,11 +299,13 @@ def main():
         print("No new messages to move.")
         return
 
-    with Pool(processes=parallel_processes) as pool:
+    manager = Manager()
+    lock = manager.Lock()
+
+    with Pool(processes=parallel_processes, initializer=init_pool, initargs=(lock,)) as pool:
         results = pool.map(process_move, pending_records)
 
     successful_ids = [ee_id for ee_id in results if ee_id is not None]
-    append_logged_ids(logs_file, successful_ids)
     print(f"Moved {len(successful_ids)} messages to INBOX.")
 
 

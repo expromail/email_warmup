@@ -1,3 +1,4 @@
+import csv
 import random
 from multiprocessing import Pool
 
@@ -25,18 +26,31 @@ WHERE 1=1
     AND date(ts) >= today() - INTERVAL 2 day
     AND is_sent = 1
     AND rand() % 1000 = 0
-LIMIT 10;
+LIMIT 1000;
 """
 
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
 spam_senders_file = "spam_senders.txt"
-seed_list_file = "seed_list.txt"
+seed_list_file = "seed_list.csv"
 
 
 def read_lines(path):
     try:
         with open(path, "r", encoding="utf-8") as file:
             return [line.strip() for line in file if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def read_seed_emails(path):
+    try:
+        with open(path, newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            return [
+                (row.get("email") or "").strip()
+                for row in reader
+                if (row.get("email") or "").strip()
+            ]
     except FileNotFoundError:
         return []
 
@@ -66,28 +80,31 @@ def send_from_sender(args):
         print(f"No messages to send for sender {sender}")
         return 0
 
-    message = random.choice(messages)
-    plain_text, html = build_body_parts(message)
-    subject = message.get("subject") or ""
-
     if not seeds:
         print(f"No seed recipients available for sender {sender}")
         return 0
 
-    recipients = random.sample(list(seeds), min(5, len(seeds)))
-    recipients_str = ",".join(recipients)
+    recipients = random.sample(list(seeds), min(7, len(seeds)))
 
+    total_sent = 0
     try:
-        send_email(
-            sender=sender,
-            recipients=recipients_str,
-            subject=subject,
-            text=plain_text or "",
-            html=html,
-            message_type="spam",
-        )
-        print(f"Sent spam email from {sender} to {len(recipients)} recipients.")
-        return len(recipients)
+        for recipient in recipients:
+            for _ in range(8):
+                message = random.choice(messages)
+                plain_text, html = build_body_parts(message)
+                subject = message.get("subject") or ""
+
+                send_email(
+                    sender=sender,
+                    recipients=recipient,
+                    subject=subject,
+                    text=plain_text or "",
+                    html=html,
+                    message_type="spam",
+                )
+                total_sent += 1
+        print(f"Sent {total_sent} spam emails from {sender} to {len(recipients)} recipients.")
+        return total_sent
     except Exception as exc:
         print(f"Failed sending from {sender} to seeds {recipients}: {exc}")
         return 0
@@ -105,7 +122,7 @@ def main():
         return
 
     senders = read_lines(spam_senders_file)
-    seeds = read_lines(seed_list_file)
+    seeds = read_seed_emails(seed_list_file)
     messages = fetch_candidate_messages()
 
     if not senders:
@@ -113,7 +130,7 @@ def main():
         return
 
     if not seeds:
-        print("No recipients found in seed_list.txt")
+        print("No recipients found in seed_list.csv")
         return
 
     if not messages:

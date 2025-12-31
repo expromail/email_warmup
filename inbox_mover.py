@@ -1,5 +1,7 @@
 import csv
 import os
+import time
+import random
 from multiprocessing import Manager, Pool
 from clickhouse_driver import Client
 from utils import (
@@ -15,7 +17,7 @@ SELECT
     arrayElement(recipients, 1) AS email
 FROM email_letters_first_emails
 WHERE 1=1
-    AND date(created_at) >= today() - INTERVAL '2 day'
+    AND date(created_at) >= today() - INTERVAL '1 day'
     AND path = '\\Junk'
     AND (id LIKE '<curious-gepard%' or id LIKE '%-mldz%')
 """
@@ -141,6 +143,8 @@ def main():
         print("No new messages to move.")
         return
 
+    random.shuffle(mapped_records)
+
     manager = Manager()
     lock = manager.Lock()
 
@@ -149,7 +153,14 @@ def main():
         initializer=init_pool,
         initargs=(lock,),
     ) as pool:
-        results = pool.map(process_move, mapped_records)
+        results = []
+        total = len(mapped_records)
+        for start in range(0, total, 600):
+            batch = mapped_records[start : start + 600]
+            results.extend(pool.map(process_move, batch))
+            if start + 600 < total:
+                print("Processed 600 messages, pausing for 7 seconds...")
+                time.sleep(7)
 
     successful_ids = [ee_id for ee_id in results if ee_id is not None]
     print(f"Moved {len(successful_ids)} messages to INBOX.")

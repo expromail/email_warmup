@@ -1,3 +1,4 @@
+import csv
 import random
 import socket
 from multiprocessing import Pool
@@ -13,30 +14,64 @@ from utils import (
 )
 
 sql_query = """
-SELECT sender_email, subject, email_body as plain_text, email_html
+SELECT
+  sender_email,
+  subject,
+  plain_text,
+  email_html
 FROM
-    smtp_logs
-WHERE 1=1
-    AND subject LIKE 'Simple fix for%deliverability'
-    AND is_warmup = False
-    AND is_followup = False
-    AND is_spamtest = False
-    AND date(ts) >= today() - INTERVAL '3 day'
-    AND is_sent = True
+(
+  SELECT
+    sender_email,
+    subject,
+    email_body AS plain_text,
+    email_html
+  FROM smtp_logs
+  WHERE
+    is_warmup = false
+    AND is_followup = false
+    AND is_spamtest = false
+    AND is_sent = true
+    AND email_html != email_body
+    AND ts >= today() AND ts < today() + INTERVAL 1 DAY
+    AND (cityHash64(sender_email, subject, ts) % 2) = 0
+  LIMIT 50000          -- safety buffer
+)
+ORDER BY rand()
+LIMIT 20000;
 """
 
-seed_list_file = "seed_list.txt"
+seed_list_file = "seed_list.csv"
 warmup_senders_file = "email_to_warmup.txt"
 
 same_sender_count = int(env.get("WARMUP_SAME_SENDER_COUNT", 1))
 warmup_sender_count = int(env.get("WARMUP_WARMUP_SENDER_COUNT", 3))
-parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
+parallel_processes = int(env.get("PARALLEL_PROCESSES", 4))
+send_from_original_sender = str(env.get("SEND_FROM_ORIGINAL_SENDER", "true")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def read_lines(path):
     try:
         with open(path, "r", encoding="utf-8") as file:
             return [line.strip() for line in file if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def read_seed_emails(path):
+    try:
+        with open(path, newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            return [
+                (row.get("email") or "").strip()
+                for row in reader
+                if (row.get("email") or "").strip()
+            ]
     except FileNotFoundError:
         return []
 
@@ -67,11 +102,25 @@ def build_body_parts(message):
 
 
 smtp_conn = None
+worker_messages = []
+worker_seeds = []
+worker_warmup_senders = []
+worker_batches_processed = 0
 
 
-def init_worker():
-    global smtp_conn
+def chunked_ranges(total, size):
+    for start in range(0, total, size):
+        end = min(start + size, total)
+        yield (start, end)
+
+
+def init_worker(messages, seeds, warmup_senders):
+    global smtp_conn, worker_messages, worker_seeds, worker_warmup_senders, worker_batches_processed
+    worker_messages = messages
+    worker_seeds = seeds
+    worker_warmup_senders = warmup_senders
     smtp_conn = create_smtp_connection()
+    worker_batches_processed = 0
 
 
 def send_task(task):
@@ -113,6 +162,47 @@ def send_task(task):
             return False
 
 
+def process_batch(batch):
+    global smtp_conn, worker_batches_processed
+    start, end = batch
+    delivered = 0
+    sends_per_message = same_sender_count + warmup_sender_count
+    for idx in range(start, end):
+        message_index = idx // sends_per_message
+        position = idx % sends_per_message
+        message = worker_messages[message_index]
+
+        primary_sender_pool = (
+            [message["sender"]]
+            if send_from_original_sender and message.get("sender")
+            else worker_warmup_senders
+        )
+
+        if position < same_sender_count:
+            sender = random.choice(primary_sender_pool)
+        else:
+            sender = random.choice(worker_warmup_senders)
+
+        task = {
+            "sender": sender,
+            "recipient": random.choice(worker_seeds),
+            "message": message,
+        }
+        if send_task(task):
+            delivered += 1
+
+    print(f"Delivered {delivered} warmup emails in this batch (batch size={end - start})")
+    worker_batches_processed += 1
+    if worker_batches_processed % 5 == 0:
+        try:
+            if smtp_conn is not None:
+                smtp_conn.quit()
+        except Exception:
+            pass
+        smtp_conn = create_smtp_connection()
+    return delivered
+
+
 def main():
     if not smtp_server:
         print("SMTP_SERVER is not configured; aborting send.")
@@ -124,12 +214,14 @@ def main():
         print(f"SMTP server '{smtp_server}' cannot be resolved: {exc}. Aborting.")
         return
 
-    seeds = read_lines(seed_list_file)
+    seeds = read_seed_emails(seed_list_file)
     warmup_senders = read_lines(warmup_senders_file)
+    print("Fetching candidate messages from database...")
     messages = fetch_candidate_messages()
+    print(f"Finished fetching candidate messages (count={len(messages)})")
 
     if not seeds:
-        print("No recipients found in seed_list.txt")
+        print("No recipients found in seed_list.csv")
         return
 
     if not warmup_senders:
@@ -140,33 +232,23 @@ def main():
         print("No candidate messages fetched from smtp_logs.")
         return
 
-    tasks = []
-    for message in messages:
-        sender = message["sender"]
+    sends_per_message = same_sender_count + warmup_sender_count
+    if sends_per_message <= 0:
+        print("Warmup sender counts are zero; nothing to send.")
+        return
 
-        for _ in range(same_sender_count):
-            tasks.append(
-                {
-                    "sender": sender,
-                    "recipient": random.choice(seeds),
-                    "message": message,
-                }
-            )
+    total_sends = len(messages) * sends_per_message
+    batches = list(chunked_ranges(total_sends, 100))
 
-        for _ in range(warmup_sender_count):
-            tasks.append(
-                {
-                    "sender": random.choice(warmup_senders),
-                    "recipient": random.choice(seeds),
-                    "message": message,
-                }
-            )
+    with Pool(
+        processes=parallel_processes,
+        initializer=init_worker,
+        initargs=(messages, seeds, warmup_senders),
+    ) as pool:
+        results = pool.map(process_batch, batches, chunksize=1)
 
-    with Pool(processes=parallel_processes, initializer=init_worker) as pool:
-        results = pool.map(send_task, tasks)
-
-    successes = sum(1 for r in results if r)
-    print(f"Sent {successes} warmup emails (tasks={len(tasks)})")
+    successes = sum(results)
+    print(f"Sent {successes} warmup emails (tasks={total_sends}, batches={len(batches)})")
 
 
 if __name__ == "__main__":

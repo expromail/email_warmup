@@ -1,3 +1,4 @@
+import csv
 from multiprocessing import Manager, Pool
 
 from clickhouse_driver import Client
@@ -9,17 +10,32 @@ from utils import (
 )
 
 sql_query = """
-SELECT ee_id, ee_account_id
-FROM email_letters
+SELECT
+    ee_id,
+    arrayElement(recipients, 1) AS email
+FROM email_letters_first_emails
 WHERE 1=1
     AND date(created_at) >= today() - INTERVAL '2 day'
     AND path = '\\Inbox'
-    AND status = 'received'
     AND id LIKE '%-smdz%'
 """
 
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
 logs_file = "spam_log.txt"
+
+
+def load_seed_accounts(path="seed_list.csv"):
+    try:
+        with open(path, newline="", encoding="utf-8") as csv_file:
+            reader = csv.DictReader(csv_file)
+            return {
+                (row.get("email") or "").strip().lower(): (row.get("ee_account_id") or "").strip()
+                for row in reader
+                if (row.get("email") or "").strip() and (row.get("ee_account_id") or "").strip()
+            }
+    except FileNotFoundError:
+        print(f"Seed list not found at {path}")
+        return {}
 
 
 def read_logged_ids(path):
@@ -75,12 +91,29 @@ def main():
     client = Client(**clickhouse_config_spam_tests)
     records = fetch_messages(client, sql_query)
 
+    seed_accounts = load_seed_accounts()
+    if not seed_accounts:
+        print("No seed accounts loaded; aborting.")
+        return
+
     processed_ids = read_logged_ids(logs_file)
     pending_records = [record for record in records if record[0] not in processed_ids]
 
-    print(f"Fetched {len(pending_records)} messages from the database to move to SPAM.")
+    mapped_records = []
+    missing_accounts = 0
 
-    if not pending_records:
+    for ee_id, email in pending_records:
+        account_id = seed_accounts.get((email or "").lower())
+        if not account_id:
+            missing_accounts += 1
+            continue
+        mapped_records.append((ee_id, account_id))
+
+    print(f"Fetched {len(pending_records)} messages from the database to move to SPAM.")
+    if missing_accounts:
+        print(f"Skipped {missing_accounts} messages without matching ee_account_id in seed_list.")
+
+    if not mapped_records:
         print("No new messages to move.")
         return
 
@@ -92,7 +125,7 @@ def main():
         initializer=init_pool,
         initargs=(lock,),
     ) as pool:
-        results = pool.map(process_move, pending_records)
+        results = pool.map(process_move, mapped_records)
 
     successful_ids = [ee_id for ee_id in results if ee_id is not None]
     print(f"Moved {len(successful_ids)} messages to SPAM.")

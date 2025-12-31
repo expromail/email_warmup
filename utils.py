@@ -135,7 +135,7 @@ def _ee_services():
     ]
 
 
-@retry_on_status_code(retries=5, delay=6, stop_statuses={200, 404})
+@retry_on_status_code(retries=2, delay=2, stop_statuses={200, 404})
 def _move_message_with_service(service_url, api_key, account, message, folder="Junk Email"):
     url = f"{service_url}/v1/account/{account}/message/{message}/move"
 

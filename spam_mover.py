@@ -24,7 +24,7 @@ parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
 logs_file = "spam_log.txt"
 
 
-def load_seed_accounts(path="seed_list.csv"):
+def load_seed_accounts(path="seed_list_all.csv"):
     try:
         with open(path, newline="", encoding="utf-8") as csv_file:
             reader = csv.DictReader(csv_file)

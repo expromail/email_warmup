@@ -23,6 +23,7 @@ WHERE 1=1
     AND is_warmup = 0
     AND is_followup = 0
     AND is_spamtest = 0
+    AND email_html != email_body
     AND date(ts) >= today() - INTERVAL 2 day
     AND is_sent = 1
     AND rand() % 1000 = 0
@@ -31,7 +32,7 @@ LIMIT 1000;
 
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
 spam_senders_file = "spam_senders.txt"
-seed_list_file = "seed_list.csv"
+seed_list_file = "seed_list_warmup.csv"
 
 
 def read_lines(path):
@@ -84,12 +85,12 @@ def send_from_sender(args):
         print(f"No seed recipients available for sender {sender}")
         return 0
 
-    recipients = random.sample(list(seeds), min(7, len(seeds)))
+    recipients = random.sample(list(seeds), min(25, len(seeds)))
 
     total_sent = 0
     try:
         for recipient in recipients:
-            for _ in range(8):
+            for _ in range(4):
                 message = random.choice(messages)
                 plain_text, html = build_body_parts(message)
                 subject = message.get("subject") or ""

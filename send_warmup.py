@@ -41,10 +41,10 @@ FROM
   LIMIT 100000          -- safety buffer
 )
 ORDER BY rand()
-LIMIT 50000;
+LIMIT 35000;
 """ # ts >= today() AND ts < today() + INTERVAL 1 DAY
 
-seed_list_file = "seed_list.csv"
+seed_list_file = "seed_list_warmup.csv"
 warmup_senders_file = "email_to_warmup.txt"
 
 same_sender_count = int(env.get("WARMUP_SAME_SENDER_COUNT", 1))

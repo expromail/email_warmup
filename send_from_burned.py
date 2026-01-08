@@ -44,7 +44,7 @@ AND sender NOT LIKE '%dosomail%'
 """
 
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 3))
-seed_list_file = "seed_list.csv"
+seed_list_file = "seed_list_warmup.csv"
 
 
 def read_seed_emails(path):

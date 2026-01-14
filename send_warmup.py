@@ -30,21 +30,40 @@ FROM
     email_body AS plain_text,
     email_html
   FROM smtp_logs
-  WHERE
-    is_warmup = false
+  WHERE 1=1
+    AND is_warmup = false
     AND is_followup = false
     AND is_spamtest = false
     AND is_sent = true
-    AND email_html != email_body
-    AND ts >= today() - INTERVAL 1 DAY
+    AND NOT match(message_headers, 'X-Ref-Id')
+    AND NOT match(message_headers, 'X-Auto-Response-Suppress')
+    AND NOT match(rcp_email, '@(gmail|yahoo|hotmail)\\.com$')
+    AND ts >= today() - INTERVAL 2 DAY
+--    AND date(ts) == yesterday()
     AND (cityHash64(sender_email, subject, ts) % 2) = 0
   LIMIT 100000          -- safety buffer
 )
 ORDER BY rand()
-LIMIT 35000;
+LIMIT 30000;
 """ # ts >= today() AND ts < today() + INTERVAL 1 DAY
 
-seed_list_file = "seed_list_warmup.csv"
+sql_query_spamtest = '''
+  SELECT
+    sender_email,
+    original_sender_email,
+    subject,
+    email_body AS plain_text,
+    email_html
+  FROM smtp_logs
+  WHERE 1=1
+    AND match(envelope_content, 'mlrch-')
+    AND NOT match(rcp_email, '@(gmail|yahoo|hotmail|outlook|mailreech|emailreach|outreachrs)\\.com$')
+    AND date(ts) >= today() - INTERVAL '17 day'
+    AND is_sent = True
+'''
+
+
+seed_list_file = "seed_list_all.csv"
 warmup_senders_file = "email_to_warmup.txt"
 
 same_sender_count = int(env.get("WARMUP_SAME_SENDER_COUNT", 1))

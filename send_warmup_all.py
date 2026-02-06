@@ -2,7 +2,11 @@ import argparse
 import csv
 import random
 import socket
+import time
+from datetime import date
 from multiprocessing import Pool
+
+import psycopg2
 
 from utils import (
     clickhouse_config_smtp_log,
@@ -13,111 +17,31 @@ from utils import (
     smtp_port,
     smtp_server,
 )
-import time
 
-sql_query_og = """
+sql_query = """
 SELECT
-  sender_email,
-  original_sender_email,
-  subject,
-  plain_text,
-  email_html
-FROM
-(
-  SELECT
     sender_email,
     original_sender_email,
     subject,
     email_body AS plain_text,
     email_html
-  FROM smtp_logs
-  WHERE 1=1
-    AND is_warmup = false
+FROM smtp_logs
+WHERE
+    is_warmup = false
     AND is_followup = false
     AND is_spamtest = false
     AND is_sent = true
     AND NOT match(message_headers, 'X-Ref-Id')
     AND NOT match(message_headers, 'X-Auto-Response-Suppress')
     AND NOT match(rcp_email, '@(gmail|yahoo|hotmail)\\.com$')
---    AND ts >= today() - INTERVAL 2 DAY
-    AND date(ts) == yesterday()
-    AND (cityHash64(sender_email, subject, ts) % 2) = 0
-  LIMIT 100000          -- safety buffer
-)
+    AND ts >= today() - INTERVAL 3 DAY
 ORDER BY rand()
-LIMIT 35000;
-""" # ts >= today() AND ts < today() + INTERVAL 1 DAY
+LIMIT 5000;
+"""
 
-sql_query_spamtest = '''
-  SELECT
-    sender_email,
-    original_sender_email,
-    subject,
-    email_body AS plain_text,
-    email_html
-  FROM smtp_logs
-  WHERE 1=1
-    AND match(envelope_content, 'mlrch-')
-    AND NOT match(rcp_email, '@(gmail|yahoo|hotmail|outlook|mailreech|emailreach|outreachrs)\\.com$')
-    AND date(ts) >= today() - INTERVAL '17 day'
-    AND is_sent = True
-'''
-
-# this is Carl
-sql_query = '''
-  SELECT
-    sender_email,
-    original_sender_email,
-    subject,
-    email_body AS plain_text,
-    email_html
-FROM enriched_smtp_logs
-
-WHERE 1=1
-    AND user_id IN (6306, 2419) -- change to 6306
-    AND is_warmup = False
-    AND is_spamtest = False
-    AND is_followup = False
-    AND is_sent = True
-    --AND date(ts) == yesterday()
-    AND ts >= today() - INTERVAL 3 DAY
-'''
-
-sql_query_all = '''
-  SELECT
-    sender_email,
-    original_sender_email,
-    subject,
-    email_body AS plain_text,
-    email_html
-  FROM smtp_logs
-  WHERE 1=1
-    AND is_warmup = false
-    AND is_followup = false
-    AND is_spamtest = false
-    AND is_sent = true
-    AND NOT match(message_headers, 'X-Ref-Id')
-    AND NOT match(message_headers, 'X-Auto-Response-Suppress')
-    AND NOT match(rcp_email, '@(gmail|yahoo|hotmail)\\.com$')
-    AND ts >= today() - INTERVAL 3 DAY
-'''
-
-
-seed_list_file = "seed_list_warmup.csv"
-warmup_senders_file = "email_to_warmup.txt"
-
-same_sender_count = int(env.get("WARMUP_SAME_SENDER_COUNT", 1))
-original_sender_count = int(env.get("WARMUP_ORIGINAL_SENDER_COUNT", 0))
-warmup_sender_count = int(env.get("WARMUP_WARMUP_SENDER_COUNT", 3))
+seed_list_file = "seed_list_all.csv"
+same_sender_count = int(env.get("WARMUP_SAME_SENDER_COUNT", 6))
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 4))
-
-
-def read_lines(path):
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            return [line.strip() for line in file if line.strip()]
-    except FileNotFoundError:
-        return []
 
 
 def read_seed_emails(path):
@@ -148,21 +72,98 @@ def fetch_candidate_messages():
     ]
 
 
+def fetch_email_accounts(domain_parity):
+    print("Fetching email accounts from PostgreSQL...")
+    host = env.get("PG_HOST")
+    port = env.get("PG_PORT", "5432")
+    user = env.get("PG_USER")
+    password = env.get("PG_PASSWORD")
+    dbname = env.get("PG_DB")
+
+    missing = [
+        key
+        for key, value in {
+            "PG_HOST": host,
+            "PG_USER": user,
+            "PG_PASSWORD": password,
+            "PG_DB": dbname,
+        }.items()
+        if not value
+    ]
+    if missing:
+        print(f"Missing PostgreSQL config in .env: {', '.join(missing)}")
+        return []
+
+    query = """
+SELECT
+  ea.email_account,
+  ea.domain_id
+FROM email_accounts AS ea
+JOIN email_domains  AS ed
+  ON ed.id = ea.domain_id
+WHERE
+  ea.is_active = TRUE
+  AND ea.is_hidden = FALSE
+  AND ea.provider = 'MAILDOSO'
+  AND ea.email_account NOT LIKE '%%maildoso%%'
+  AND ea.domain_id %% 2 = %s         -- pass 0 for even, 1 for odd
+  AND ed.domain_status <> 'BLACKLISTED';
+    """
+
+    try:
+        with psycopg2.connect(
+            host=host,
+            port=int(port),
+            user=user,
+            password=password,
+            dbname=dbname,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (domain_parity,))
+                rows = cur.fetchall()
+                results = []
+                skipped = 0
+                for row in rows:
+                    if len(row) < 2:
+                        skipped += 1
+                        continue
+                    email_account = row[0]
+                    domain_id = row[1]
+                    if not email_account or domain_id is None:
+                        skipped += 1
+                        continue
+                    results.append((email_account, domain_id))
+                if skipped:
+                    print(
+                        "Warning: skipped "
+                        f"{skipped} rows missing email_account or domain_id."
+                    )
+                return results
+    except Exception as exc:
+        print(f"Failed to fetch email accounts from PostgreSQL: {exc}")
+        return []
+
+
 def build_body_parts(message):
     plain_text = message.get("plain_text")
     html = message.get("html")
 
-    # Normalize empty strings to None
     plain_text = plain_text if plain_text else None
     html = html if html else None
 
     return plain_text, html
 
 
+def pick_recipients(seed_pool, count):
+    if not seed_pool:
+        return []
+    if count <= len(seed_pool):
+        return random.sample(seed_pool, count)
+    return random.choices(seed_pool, k=count)
+
+
 smtp_conn = None
 worker_tasks = []
-worker_seeds = []
-worker_warmup_senders = []
 worker_batches_processed = 0
 worker_custom_message_id = None
 
@@ -173,12 +174,9 @@ def chunked_ranges(total, size):
         yield (start, end)
 
 
-def init_worker(tasks, seeds, warmup_senders, custom_message_id):
-    global smtp_conn, worker_tasks, worker_seeds, worker_warmup_senders
-    global worker_batches_processed, worker_custom_message_id
+def init_worker(tasks, custom_message_id):
+    global smtp_conn, worker_tasks, worker_batches_processed, worker_custom_message_id
     worker_tasks = tasks
-    worker_seeds = seeds
-    worker_warmup_senders = warmup_senders
     worker_custom_message_id = custom_message_id
     smtp_conn = safe_create_smtp_connection()
     worker_batches_processed = 0
@@ -218,8 +216,7 @@ def send_task(task):
             custom_message_id=worker_custom_message_id,
         )
         return True
-    except Exception as exc:
-        # Attempt one reconnect and retry
+    except Exception:
         try:
             new_conn = create_smtp_connection()
             globals()["smtp_conn"] = new_conn
@@ -249,16 +246,9 @@ def process_batch(batch):
         if smtp_conn is None:
             print(f"Skipping batch due to SMTP connection failure (batch size={batch_size})")
             return 0, batch_size
+
     for idx in range(start, end):
         task = worker_tasks[idx]
-        sender = task["sender"]
-        if sender is None:
-            sender = random.choice(worker_warmup_senders)
-        task = {
-            "sender": sender,
-            "recipient": random.choice(worker_seeds),
-            "message": task["message"],
-        }
         if send_task(task):
             delivered += 1
 
@@ -277,7 +267,7 @@ def process_batch(batch):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Send warmup emails with configurable parallelism."
+        description="Send warmup emails across all mailboxes with domain grouping."
     )
     parser.add_argument(
         "parallel_processes",
@@ -309,62 +299,68 @@ def main():
         return
 
     seeds = read_seed_emails(seed_list_file)
-    warmup_senders = read_lines(warmup_senders_file)
     print("Fetching candidate messages from database...")
     messages = fetch_candidate_messages()
     print(f"Finished fetching candidate messages (count={len(messages)})")
 
     if not seeds:
-        print("No recipients found in seed_list.csv")
-        return
-
-    if not warmup_senders:
-        print("No warmup senders found in email_to_warmup.txt")
+        print("No recipients found in seed_list_warmup.csv")
         return
 
     if not messages:
         print("No candidate messages fetched from smtp_logs.")
         return
 
-    per_message_min = same_sender_count + warmup_sender_count
-    if per_message_min <= 0 and original_sender_count <= 0:
-        print("Warmup sender counts are zero; nothing to send.")
+    if same_sender_count <= 0:
+        print("WARMUP_SAME_SENDER_COUNT must be greater than zero.")
         return
 
+    today_parity = 0 if date.today().day % 2 == 0 else 1
+    accounts = fetch_email_accounts(today_parity)
+    if not accounts:
+        parity_label = "even" if today_parity == 0 else "odd"
+        print(f"No active email accounts found for {parity_label} domains.")
+        return
+
+    domain_accounts = {}
+    for email_account, domain_id in accounts:
+        domain_accounts.setdefault(domain_id, []).append(email_account)
+
+    domain_ids = list(domain_accounts.keys())
+    random.shuffle(domain_ids)
+    print(
+        "Fetched "
+        f"{len(accounts)} email accounts across {len(domain_ids)} domains."
+    )
+
     tasks = []
-    for message in messages:
-        sender = message.get("sender")
-        original_sender = message.get("original_sender")
-        if sender:
-            tasks.extend(
-                {"sender": sender, "message": message}
-                for _ in range(max(same_sender_count, 0))
-            )
-        if (
-            sender
-            and original_sender
-            and original_sender != sender
-            and original_sender_count > 0
-        ):
-            tasks.extend(
-                {"sender": original_sender, "message": message}
-                for _ in range(original_sender_count)
-            )
-        if warmup_sender_count > 0:
-            tasks.extend({"sender": None, "message": message} for _ in range(warmup_sender_count))
+    for domain_id in domain_ids:
+        accounts_for_domain = domain_accounts.get(domain_id, [])
+        if not accounts_for_domain:
+            continue
+        domain_message = random.choice(messages)
+        domain_recipients = pick_recipients(seeds, same_sender_count)
+        for sender in accounts_for_domain:
+            for recipient in domain_recipients:
+                tasks.append(
+                    {
+                        "sender": sender,
+                        "recipient": recipient,
+                        "message": domain_message,
+                    }
+                )
 
     if not tasks:
         print("No warmup tasks were generated with current sender counts.")
         return
 
-    random.shuffle(tasks)
     total_sends = len(tasks)
     batches = list(chunked_ranges(total_sends, 100))
 
     with Pool(
         processes=args.parallel_processes,
         initializer=init_worker,
-        initargs=(tasks, seeds, warmup_senders, args.custom_message_id),
+        initargs=(tasks, args.custom_message_id),
     ) as pool:
         successes = 0
         completed_tasks = 0

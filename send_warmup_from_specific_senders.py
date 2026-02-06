@@ -2,6 +2,7 @@ import argparse
 import csv
 import random
 import socket
+import time
 from multiprocessing import Pool
 
 from utils import (
@@ -13,102 +14,45 @@ from utils import (
     smtp_port,
     smtp_server,
 )
-import time
 
-sql_query_og = """
+sql_query = """
 SELECT
   sender_email,
   original_sender_email,
   subject,
-  plain_text,
+  email_body AS plain_text,
   email_html
-FROM
-(
-  SELECT
-    sender_email,
-    original_sender_email,
-    subject,
-    email_body AS plain_text,
-    email_html
-  FROM smtp_logs
-  WHERE 1=1
-    AND is_warmup = false
-    AND is_followup = false
-    AND is_spamtest = false
-    AND is_sent = true
-    AND NOT match(message_headers, 'X-Ref-Id')
-    AND NOT match(message_headers, 'X-Auto-Response-Suppress')
-    AND NOT match(rcp_email, '@(gmail|yahoo|hotmail)\\.com$')
---    AND ts >= today() - INTERVAL 2 DAY
-    AND date(ts) == yesterday()
-    AND (cityHash64(sender_email, subject, ts) % 2) = 0
-  LIMIT 100000          -- safety buffer
-)
-ORDER BY rand()
-LIMIT 35000;
-""" # ts >= today() AND ts < today() + INTERVAL 1 DAY
-
-sql_query_spamtest = '''
-  SELECT
-    sender_email,
-    original_sender_email,
-    subject,
-    email_body AS plain_text,
-    email_html
-  FROM smtp_logs
-  WHERE 1=1
-    AND match(envelope_content, 'mlrch-')
-    AND NOT match(rcp_email, '@(gmail|yahoo|hotmail|outlook|mailreech|emailreach|outreachrs)\\.com$')
-    AND date(ts) >= today() - INTERVAL '17 day'
-    AND is_sent = True
-'''
-
-# this is Carl
-sql_query = '''
-  SELECT
-    sender_email,
-    original_sender_email,
-    subject,
-    email_body AS plain_text,
-    email_html
 FROM enriched_smtp_logs
+WHERE 1=1
+  AND user_id = 1711
+  AND is_warmup = False
+  AND is_spamtest = False
+  AND is_followup = False
+  AND is_sent = True
+  AND date(ts) >= today() - INTERVAL '3 day'
+ORDER BY rand()
+LIMIT 10
+"""
+
+sql_query222 = '''
+SELECT
+  sender_email,
+  original_sender_email,
+  subject,
+  email_body AS plain_text,
+  email_html
+FROM smtp_logs
 
 WHERE 1=1
-    AND user_id IN (6306, 2419) -- change to 6306
-    AND is_warmup = False
-    AND is_spamtest = False
-    AND is_followup = False
-    AND is_sent = True
-    --AND date(ts) == yesterday()
-    AND ts >= today() - INTERVAL 3 DAY
-'''
-
-sql_query_all = '''
-  SELECT
-    sender_email,
-    original_sender_email,
-    subject,
-    email_body AS plain_text,
-    email_html
-  FROM smtp_logs
-  WHERE 1=1
-    AND is_warmup = false
-    AND is_followup = false
-    AND is_spamtest = false
-    AND is_sent = true
-    AND NOT match(message_headers, 'X-Ref-Id')
-    AND NOT match(message_headers, 'X-Auto-Response-Suppress')
-    AND NOT match(rcp_email, '@(gmail|yahoo|hotmail)\\.com$')
-    AND ts >= today() - INTERVAL 3 DAY
+    AND email_html LIKE '%6ab3d7176947b45d8%'
+    AND date(ts) >= yesterday()
+LIMIT 10
 '''
 
 
 seed_list_file = "seed_list_warmup.csv"
 warmup_senders_file = "email_to_warmup.txt"
 
-same_sender_count = int(env.get("WARMUP_SAME_SENDER_COUNT", 1))
-original_sender_count = int(env.get("WARMUP_ORIGINAL_SENDER_COUNT", 0))
-warmup_sender_count = int(env.get("WARMUP_WARMUP_SENDER_COUNT", 3))
 parallel_processes = int(env.get("PARALLEL_PROCESSES", 4))
 
 
@@ -162,9 +106,21 @@ def build_body_parts(message):
 smtp_conn = None
 worker_tasks = []
 worker_seeds = []
-worker_warmup_senders = []
 worker_batches_processed = 0
 worker_custom_message_id = None
+worker_references = False
+worker_reply_to_sender = False
+
+
+def create_smtp_connection_with_retry(max_attempts=3, delay=3):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return create_smtp_connection()
+        except Exception as exc:
+            print(f"SMTP connection failed (attempt {attempt}/{max_attempts}): {exc}")
+            if attempt < max_attempts:
+                time.sleep(delay)
+    return None
 
 
 def chunked_ranges(total, size):
@@ -173,35 +129,29 @@ def chunked_ranges(total, size):
         yield (start, end)
 
 
-def init_worker(tasks, seeds, warmup_senders, custom_message_id):
-    global smtp_conn, worker_tasks, worker_seeds, worker_warmup_senders
-    global worker_batches_processed, worker_custom_message_id
+def init_worker(tasks, seeds, custom_message_id, references, reply_to_sender):
+    global smtp_conn, worker_tasks, worker_seeds, worker_batches_processed, worker_custom_message_id
+    global worker_references, worker_reply_to_sender
     worker_tasks = tasks
     worker_seeds = seeds
-    worker_warmup_senders = warmup_senders
-    worker_custom_message_id = custom_message_id
-    smtp_conn = safe_create_smtp_connection()
+    smtp_conn = create_smtp_connection_with_retry()
     worker_batches_processed = 0
-
-
-def safe_create_smtp_connection(max_attempts=3, base_delay=1.0):
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return create_smtp_connection()
-        except Exception as exc:
-            if attempt == max_attempts:
-                print(f"Failed to create SMTP connection after {attempt} attempts: {exc}")
-                return None
-            delay = base_delay * (2 ** (attempt - 1))
-            print(f"SMTP connection failed (attempt {attempt}): {exc}. Retrying in {delay:.1f}s.")
-            time.sleep(delay)
-    return None
+    worker_custom_message_id = custom_message_id
+    worker_references = references
+    worker_reply_to_sender = reply_to_sender
 
 
 def send_task(task):
     sender = task["sender"]
     recipient = task["recipient"]
     message = task["message"]
+
+    global smtp_conn, worker_custom_message_id, worker_references, worker_reply_to_sender
+    if smtp_conn is None:
+        smtp_conn = create_smtp_connection_with_retry()
+        if smtp_conn is None:
+            print(f"Skipping send from {sender} to {recipient}: no SMTP connection.")
+            return False
 
     plain_text, html = build_body_parts(message)
     subject = message.get("subject") or ""
@@ -215,13 +165,17 @@ def send_task(task):
             text=plain_text or "",
             html=html,
             message_type="warmup",
+            references=worker_references,
+            reply_to=sender if worker_reply_to_sender else None,
             custom_message_id=worker_custom_message_id,
         )
         return True
     except Exception as exc:
         # Attempt one reconnect and retry
         try:
-            new_conn = create_smtp_connection()
+            new_conn = create_smtp_connection_with_retry()
+            if new_conn is None:
+                raise Exception("SMTP reconnect failed")
             globals()["smtp_conn"] = new_conn
             send_email_via_connection(
                 new_conn,
@@ -231,6 +185,8 @@ def send_task(task):
                 text=plain_text or "",
                 html=html,
                 message_type="warmup",
+                references=worker_references,
+                reply_to=sender if worker_reply_to_sender else None,
                 custom_message_id=worker_custom_message_id,
             )
             return True
@@ -243,25 +199,17 @@ def process_batch(batch):
     global smtp_conn, worker_batches_processed
     start, end = batch
     delivered = 0
-    batch_size = end - start
-    if smtp_conn is None:
-        smtp_conn = safe_create_smtp_connection()
-        if smtp_conn is None:
-            print(f"Skipping batch due to SMTP connection failure (batch size={batch_size})")
-            return 0, batch_size
     for idx in range(start, end):
         task = worker_tasks[idx]
-        sender = task["sender"]
-        if sender is None:
-            sender = random.choice(worker_warmup_senders)
         task = {
-            "sender": sender,
+            "sender": task["sender"],
             "recipient": random.choice(worker_seeds),
             "message": task["message"],
         }
         if send_task(task):
             delivered += 1
 
+    print(f"Delivered {delivered} warmup emails in this batch (batch size={end - start})")
     worker_batches_processed += 1
     if worker_batches_processed % 5 == 0:
         try:
@@ -269,15 +217,13 @@ def process_batch(batch):
                 smtp_conn.quit()
         except Exception:
             pass
-        smtp_conn = safe_create_smtp_connection()
-        if smtp_conn is None:
-            print("SMTP connection refresh failed; continuing with next batch.")
-    return delivered, batch_size
+        smtp_conn = create_smtp_connection_with_retry()
+    return delivered, (end - start)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Send warmup emails with configurable parallelism."
+        description="Send warmup emails from each warmup sender."
     )
     parser.add_argument(
         "parallel_processes",
@@ -292,6 +238,19 @@ def main():
         dest="custom_message_id",
         default=None,
         help="Custom tag to include in Message-ID local part (before UUID).",
+    )
+    parser.add_argument(
+        "-r",
+        "--references",
+        action="store_true",
+        help="Add References header identical to Message-ID.",
+    )
+    parser.add_argument(
+        "-rt",
+        "--reply-to",
+        dest="reply_to_sender",
+        action="store_true",
+        help="Add Reply-To header identical to the sender email.",
     )
     args = parser.parse_args()
     if args.parallel_processes <= 0:
@@ -326,58 +285,39 @@ def main():
         print("No candidate messages fetched from smtp_logs.")
         return
 
-    per_message_min = same_sender_count + warmup_sender_count
-    if per_message_min <= 0 and original_sender_count <= 0:
-        print("Warmup sender counts are zero; nothing to send.")
-        return
-
     tasks = []
     for message in messages:
-        sender = message.get("sender")
-        original_sender = message.get("original_sender")
-        if sender:
-            tasks.extend(
-                {"sender": sender, "message": message}
-                for _ in range(max(same_sender_count, 0))
-            )
-        if (
-            sender
-            and original_sender
-            and original_sender != sender
-            and original_sender_count > 0
-        ):
-            tasks.extend(
-                {"sender": original_sender, "message": message}
-                for _ in range(original_sender_count)
-            )
-        if warmup_sender_count > 0:
-            tasks.extend({"sender": None, "message": message} for _ in range(warmup_sender_count))
+        for sender in warmup_senders:
+            tasks.append({"sender": sender, "message": message})
 
     if not tasks:
-        print("No warmup tasks were generated with current sender counts.")
+        print("No warmup tasks were generated.")
         return
 
-    random.shuffle(tasks)
     total_sends = len(tasks)
     batches = list(chunked_ranges(total_sends, 100))
 
     with Pool(
         processes=args.parallel_processes,
         initializer=init_worker,
-        initargs=(tasks, seeds, warmup_senders, args.custom_message_id),
+        initargs=(
+            tasks,
+            seeds,
+            args.custom_message_id,
+            args.references,
+            args.reply_to_sender,
+        ),
     ) as pool:
+        completed_sends = 0
         successes = 0
-        completed_tasks = 0
         for delivered, batch_size in pool.imap_unordered(
             process_batch, batches, chunksize=1
         ):
+            completed_sends += batch_size
             successes += delivered
-            completed_tasks += batch_size
-            remaining = total_sends - completed_tasks
+            remaining = total_sends - completed_sends
             print(
-                "Batch finished: delivered "
-                f"{delivered} warmup emails (batch size={batch_size}). "
-                f"Remaining emails to send: {remaining}"
+                f"Progress: sent={successes}, completed={completed_sends}, remaining={remaining}"
             )
 
     print(f"Sent {successes} warmup emails (tasks={total_sends}, batches={len(batches)})")

@@ -101,7 +101,13 @@ def retry_on_status_code(retries=3, delay=2, stop_statuses=None):
             attempt = 0
             status_code = None
             while attempt < retries:
-                response = func(*args, **kwargs)
+                try:
+                    response = func(*args, **kwargs)
+                except requests.exceptions.RequestException as exc:
+                    attempt += 1
+                    print(f"Retry {attempt}/{retries} for {func.__name__} - Error: {exc}")
+                    time.sleep(delay)
+                    continue
                 if not isinstance(response, dict):
                     raise Exception("The response is not a valid JSON or dictionary.")
 
@@ -148,7 +154,7 @@ def _move_message_with_service(service_url, api_key, account, message, folder="J
         "path": folder,
     }
 
-    response = requests.put(url, headers=headers, json=params)
+    response = requests.put(url, headers=headers, json=params, timeout=15)
 
     try:
         result = response.json()
@@ -217,6 +223,7 @@ def _build_email_message(
     html=None,
     message_type="warmup",
     references=False,
+    reply_to=None,
     custom_message_id=False,
 ):
     if html and text:
@@ -249,6 +256,8 @@ def _build_email_message(
 
     if references:
         message["References"] = message_id
+    if reply_to:
+        message["Reply-To"] = reply_to
 
     return message, message_id
 
@@ -270,6 +279,7 @@ def send_email_via_connection(
     message_type="warmup",
     slow_mode=False,
     references=False,
+    reply_to=None,
     custom_message_id=False,
 ):
     message, _ = _build_email_message(
@@ -280,6 +290,7 @@ def send_email_via_connection(
         html=html,
         message_type=message_type,
         references=references,
+        reply_to=reply_to,
         custom_message_id=custom_message_id,
     )
 
@@ -306,6 +317,7 @@ def send_email(
     message_type="warmup",
     slow_mode=False,
     references=False,
+    reply_to=None,
     custom_message_id=False,
 ):
     with smtplib.SMTP(smtp_server, smtp_port) as server:
@@ -324,6 +336,7 @@ def send_email(
                 html=html,
                 message_type=message_type,
                 references=references,
+                reply_to=reply_to,
                 custom_message_id=custom_message_id,
             )
 

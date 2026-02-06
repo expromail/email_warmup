@@ -2,7 +2,8 @@ import csv
 import os
 import time
 import random
-from multiprocessing import Manager, Pool
+import multiprocessing
+from multiprocessing import Manager
 from clickhouse_driver import Client
 from utils import (
     clickhouse_config_spam_tests,
@@ -94,7 +95,11 @@ def log_successful_id(ee_id, ee_account_id):
 def process_move(record):
     ee_id, ee_account_id = record
 
-    response = move_message_to_folder(ee_account_id, ee_id, "INBOX")
+    try:
+        response = move_message_to_folder(ee_account_id, ee_id, "INBOX")
+    except Exception as exc:
+        print(f"Failed moving {ee_id} for account {ee_account_id}: {exc}")
+        return None
     status_code = response.get("statusCode") if isinstance(response, dict) else None
     if status_code == 200:
         log_successful_id(ee_id, ee_account_id)
@@ -148,19 +153,36 @@ def main():
     manager = Manager()
     lock = manager.Lock()
 
-    with Pool(
-        processes=parallel_processes,
-        initializer=init_pool,
-        initargs=(lock,),
-    ) as pool:
-        results = []
-        total = len(mapped_records)
+    ctx = multiprocessing.get_context("fork")
+    pool = None
+    for attempt in range(1, 4):
+        try:
+            pool = ctx.Pool(
+                processes=parallel_processes,
+                initializer=init_pool,
+                initargs=(lock,),
+            )
+            break
+        except InterruptedError as exc:
+            print(f"Pool startup interrupted (attempt {attempt}/3): {exc}")
+            time.sleep(2)
+
+    if pool is None:
+        print("Failed to start worker pool after retries.")
+        return
+
+    results = []
+    total = len(mapped_records)
+    try:
         for start in range(0, total, 600):
             batch = mapped_records[start : start + 600]
             results.extend(pool.map(process_move, batch))
             if start + 600 < total:
                 print("Processed 600 messages, pausing for 7 seconds...")
                 time.sleep(7)
+    finally:
+        pool.close()
+        pool.join()
 
     successful_ids = [ee_id for ee_id in results if ee_id is not None]
     print(f"Moved {len(successful_ids)} messages to INBOX.")
